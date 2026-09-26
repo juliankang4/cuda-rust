@@ -93,10 +93,16 @@ pub(crate) fn expand_cuda_module_inner(
     let constants = collect_cuda_module_constants(items, ident)?;
     let transformed = transform_cuda_module_items(items, &mut Vec::new(), &[], false, emit_host)?;
     if transformed.kernels.is_empty() {
-        return Err(syn::Error::new_spanned(
-            &module.ident,
-            "cuda_module found no #[kernel] functions in this module",
-        ));
+        let message = match first_item_macro_invocation(items) {
+            Some(invoked) => format!(
+                "cuda_module found no #[kernel] functions in this module; it cannot see the \
+                 items that `{invoked}!` expands to, because that invocation expands after \
+                 cuda_module runs: declare the kernels in the module itself, or have the macro \
+                 expand to the whole #[cuda_module] module"
+            ),
+            None => "cuda_module found no #[kernel] functions in this module".to_string(),
+        };
+        return Err(syn::Error::new_spanned(&module.ident, message));
     }
     reject_conflicting_kernel_names(&transformed.kernels)?;
     reject_reserved_loaded_module(items)?;
@@ -453,10 +459,11 @@ pub(crate) struct CudaModuleLevel {
 ///
 /// Every module that owns a kernel (or contains a deeper module that does)
 /// receives its own `LoadedModule`. That keeps generated method signatures in
-/// the same Rust scope as the source kernel. File-backed modules and
-/// `include!` invocations are preserved but not traversed: their contents are
-/// not present in an attribute macro's input token stream, and reproducing
-/// rustc's module loader in a proc macro is neither complete nor hygienic.
+/// the same Rust scope as the source kernel. File-backed modules and macro
+/// invocations (`include!`, a `macro_rules!` call) are preserved but not
+/// traversed: their contents are not present in an attribute macro's input
+/// token stream, and reproducing rustc's module loader or macro expansion in a
+/// proc macro is neither complete nor hygienic.
 pub(crate) fn transform_cuda_module_items(
     items: &[Item],
     module_path: &mut Vec<Ident>,
@@ -528,6 +535,23 @@ pub(crate) fn transform_cuda_module_items(
         items: transformed_items,
         kernels,
         direct_kernel_count,
+    })
+}
+
+/// The path of the first item-position macro invocation in `items` or their
+/// inline modules, other than a `macro_rules!` definition: an invocation whose
+/// expansion may declare kernels this macro never sees.
+fn first_item_macro_invocation(items: &[Item]) -> Option<String> {
+    items.iter().find_map(|item| match item {
+        Item::Macro(item_macro) if !item_macro.mac.path.is_ident("macro_rules") => {
+            let path = &item_macro.mac.path;
+            Some(quote!(#path).to_string().replace(' ', ""))
+        }
+        Item::Mod(item_mod) => item_mod
+            .content
+            .as_ref()
+            .and_then(|(_brace, nested)| first_item_macro_invocation(nested)),
+        _ => None,
     })
 }
 

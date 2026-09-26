@@ -1,0 +1,5 @@
+error: cuda_module found no #[kernel] functions in this module; it cannot see the items that `declare_kernel!` expands to, because that invocation expands after cuda_module runs: declare the kernels in the module itself, or have the macro expand to the whole #[cuda_module] module
+  --> tests/compile_fail/cuda_module_only_macro_kernels.rs:10:5
+   |
+10 | mod kernels {
+   |     ^^^^^^^
