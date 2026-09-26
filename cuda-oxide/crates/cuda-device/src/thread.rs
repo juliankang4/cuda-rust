@@ -1300,6 +1300,72 @@ const fn validate_contract_block(x: u32, y: u32, z: u32) {
     );
 }
 
+mod requires_constant_sealed {
+    pub trait Sealed {}
+
+    impl Sealed for u8 {}
+    impl Sealed for u16 {}
+    impl Sealed for u32 {}
+    impl Sealed for u64 {}
+    impl Sealed for usize {}
+}
+
+/// The types a `#[launch_contract]` `requires` relation accepts for a named
+/// constant: the unsigned integers it also accepts as scalar parameters.
+///
+/// Relations are evaluated in `u64`. The macro cannot see a constant's type, so
+/// every generated check widens a constant through this sealed trait, and
+/// rustc rejects a signed, wider or non-integer constant at the relation
+/// instead of the check converting it with `as`.
+#[doc(hidden)]
+#[diagnostic::on_unimplemented(
+    message = "a constant in a `requires` relation must be an unsigned integer (u8, u16, u32, u64 or usize), found `{Self}`",
+    label = "not an unsigned integer that widens to u64 without loss",
+    note = "`requires` relations are evaluated in u64, like the unsigned scalar parameters they may also name"
+)]
+pub trait __LaunchContractRequiresConstant: requires_constant_sealed::Sealed + Copy {
+    #[doc(hidden)]
+    fn __widen_to_u64(self) -> u64;
+}
+
+impl __LaunchContractRequiresConstant for u8 {
+    #[inline(always)]
+    fn __widen_to_u64(self) -> u64 {
+        u64::from(self)
+    }
+}
+
+impl __LaunchContractRequiresConstant for u16 {
+    #[inline(always)]
+    fn __widen_to_u64(self) -> u64 {
+        u64::from(self)
+    }
+}
+
+impl __LaunchContractRequiresConstant for u32 {
+    #[inline(always)]
+    fn __widen_to_u64(self) -> u64 {
+        u64::from(self)
+    }
+}
+
+impl __LaunchContractRequiresConstant for u64 {
+    #[inline(always)]
+    fn __widen_to_u64(self) -> u64 {
+        self
+    }
+}
+
+// `usize as u64` below is lossless only while `usize` is at most 64 bits.
+const _: () = assert!(usize::BITS <= u64::BITS);
+
+impl __LaunchContractRequiresConstant for usize {
+    #[inline(always)]
+    fn __widen_to_u64(self) -> u64 {
+        self as u64
+    }
+}
+
 /// Compiler marker for opt-in unchecked slice/array indexing.
 ///
 /// `#[kernel(unchecked_indexing)]` inserts this call. The MIR importer records

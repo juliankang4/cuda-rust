@@ -1,0 +1,16 @@
+error[E0425]: cannot find value `TIEL` in this scope
+  --> tests/compile_fail/launch_contract_requires_unresolved_constant.rs:16:40
+   |
+16 |         requires = (input.len() >= n * TIEL),
+   |                                        ^^^^ not found in this scope
+   |
+note: similarly named constant `TILE` defined here
+  --> tests/compile_fail/launch_contract_requires_unresolved_constant.rs:10:5
+   |
+10 |     const TILE: usize = 36;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^
+help: a constant with a similar name exists
+   |
+16 -         requires = (input.len() >= n * TIEL),
+16 +         requires = (input.len() >= n * TILE),
+   |

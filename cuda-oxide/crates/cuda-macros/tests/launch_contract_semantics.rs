@@ -40,4 +40,8 @@ fn launch_contract_types_are_resolved_semantically() {
     t.compile_fail(
         "tests/compile_fail/launch_contract_standalone_generic_requires_unknown_ident.rs",
     );
+    t.pass("tests/pass/launch_contract_requires_constants.rs");
+    t.compile_fail("tests/compile_fail/launch_contract_requires_signed_constant.rs");
+    t.compile_fail("tests/compile_fail/launch_contract_requires_unresolved_constant.rs");
+    t.compile_fail("tests/compile_fail/launch_contract_standalone_requires_signed_constant.rs");
 }

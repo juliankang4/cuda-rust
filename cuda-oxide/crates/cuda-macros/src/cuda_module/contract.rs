@@ -12,7 +12,7 @@ use crate::cuda_module::model::{
 };
 use crate::launch_attrs::{ClusterArgs, ConstU32Expr, LaunchBoundsArgs};
 use proc_macro2::TokenStream as TokenStream2;
-use quote::quote;
+use quote::{quote, quote_spanned};
 use syn::{
     Expr, Ident, Token, parenthesized,
     parse::{Parse, ParseStream},
@@ -35,9 +35,10 @@ pub(super) struct CudaModuleLaunchContract {
     pub(super) dynamic_shared: DynamicSharedContract,
     pub(super) dynamic_shared_alignment: u32,
     pub(super) min_compute_capability: (u32, u32),
-    /// Size requirements over the kernel's own parameters, validated
-    /// against the parameter list at expansion time. Each relation becomes an
-    /// overflow-safe host-side check in every checked launcher.
+    /// Size requirements over the kernel's own parameters and constants in
+    /// scope, validated against the parameter list at expansion time. Each
+    /// relation becomes an overflow-safe host-side check in every checked
+    /// launcher.
     pub(super) requires: Vec<Expr>,
 }
 
@@ -406,9 +407,106 @@ fn requires_grammar_help(params: &[CudaModuleParam]) -> String {
     format!(
         "each requires relation is one comparison (`>=`, `>`, `<=`, `<`, `==`, `!=`) between \
          expressions built from slice parameters as `<param>.len()`, unsigned integer scalar \
-         parameters (u8/u16/u32/u64/usize), integer literals, parentheses, and `+`, `-`, `*`; \
+         parameters (u8/u16/u32/u64/usize), constants of those types named in upper case or \
+         by path (`TILE`, `P::TILE`), integer literals, parentheses, and `+`, `-`, `*`; \
          available operands: {available}"
     )
+}
+
+/// What a path operand of a `requires` relation names.
+enum RequiresPath<'a> {
+    /// One of the kernel's parameters.
+    Param(&'a CudaModuleParam),
+    /// A constant in scope where the kernel is declared.
+    Constant,
+}
+
+/// Classifies a path operand. Validation and code generation both use this,
+/// so a relation is checked exactly as it was validated.
+///
+/// A single identifier is a parameter when the kernel has one by that name.
+/// Otherwise it is a constant when it is spelled like one, with no lower-case
+/// letter (the spelling `non_upper_case_globals` asks of constants), and a
+/// single lower-case identifier stays an error: that is the typo'd parameter
+/// name. A path of two or more segments (`self::tile`, `P::N`,
+/// `crate::m::N`) always names a constant.
+fn classify_requires_path<'a>(
+    path: &syn::ExprPath,
+    params: &'a [CudaModuleParam],
+) -> Option<RequiresPath<'a>> {
+    let Some(ident) = path.path.get_ident().filter(|_| path.qself.is_none()) else {
+        return Some(RequiresPath::Constant);
+    };
+    if let Some(param) = params.iter().find(|param| param.name == *ident) {
+        return Some(RequiresPath::Param(param));
+    }
+    let name = ident.to_string();
+    let name = name.strip_prefix("r#").unwrap_or(&name);
+    let constant_spelling =
+        name.chars().any(char::is_uppercase) && !name.chars().any(char::is_lowercase);
+    constant_spelling.then_some(RequiresPath::Constant)
+}
+
+/// Visits every operand path of a validated relation.
+fn visit_requires_paths(expr: &Expr, visit: &mut impl FnMut(&syn::ExprPath)) {
+    match expr {
+        Expr::Path(path) => visit(path),
+        Expr::Paren(paren) => visit_requires_paths(&paren.expr, visit),
+        Expr::Group(group) => visit_requires_paths(&group.expr, visit),
+        Expr::Binary(binary) => {
+            visit_requires_paths(&binary.left, visit);
+            visit_requires_paths(&binary.right, visit);
+        }
+        _ => {}
+    }
+}
+
+/// Widens one constant operand to the relation's `u64`.
+///
+/// The call carries the constant's own span, so the launchers and the check
+/// beside the kernel report a rejected constant with one identical diagnostic.
+fn requires_constant_tokens(path: &syn::ExprPath) -> TokenStream2 {
+    quote_spanned! { path.span() =>
+        ::cuda_device::thread::__LaunchContractRequiresConstant::__widen_to_u64(#path)
+    }
+}
+
+/// Names every constant the validated `relations` reference in a function
+/// that is never called, carrying `generics` so a constant may depend on the
+/// kernel's generic parameters, under the kernel's `cfg_attrs`.
+///
+/// A contract with no generated launcher (a kernel outside `#[cuda_module]`)
+/// evaluates nothing, so without this a misspelt or signed constant would
+/// compile there unnoticed. Returns nothing when no relation names a
+/// constant, so a contract over parameters and literals expands as before.
+pub(crate) fn requires_constant_checks(
+    relations: &[Expr],
+    params: &[CudaModuleParam],
+    generics: &syn::Generics,
+    cfg_attrs: &[syn::Attribute],
+) -> TokenStream2 {
+    let mut constants = Vec::new();
+    for relation in relations {
+        visit_requires_paths(relation, &mut |path| {
+            if let Some(RequiresPath::Constant) = classify_requires_path(path, params) {
+                constants.push(requires_constant_tokens(path));
+            }
+        });
+    }
+    if constants.is_empty() {
+        return TokenStream2::new();
+    }
+    let (impl_generics, _ty_generics, where_clause) = generics.split_for_impl();
+    let check = internal_ident("__cuda_oxide_requires_constants");
+    quote! {
+        #(#cfg_attrs)*
+        const _: () = {
+            #[allow(dead_code, clippy::multiple_bound_locations)]
+            fn #check #impl_generics () #where_clause {
+                #(let _ = #constants;)*
+            }
+        };
+    }
 }
 
 /// Validates every `requires` relation against the kernel's own parameter
@@ -464,7 +562,7 @@ fn requires_arithmetic_op(op: &syn::BinOp) -> bool {
 
 /// Validates one side of a `requires` comparison: an arithmetic expression
 /// over `.len()` of slice-like parameters, unsigned integer scalar
-/// parameters, and integer literals.
+/// parameters, constants, and integer literals.
 fn validate_requires_operand(expr: &Expr, params: &[CudaModuleParam]) -> syn::Result<()> {
     match expr {
         Expr::Lit(literal) => match &literal.lit {
@@ -483,25 +581,23 @@ fn validate_requires_operand(expr: &Expr, params: &[CudaModuleParam]) -> syn::Re
             )),
         },
         Expr::Path(path) => {
-            let Some(ident) = path.path.get_ident() else {
-                return Err(syn::Error::new_spanned(
-                    path,
-                    format!(
-                        "paths in requires must be bare kernel parameter names; {}",
-                        requires_grammar_help(params)
-                    ),
-                ));
+            let param = match classify_requires_path(path, params) {
+                Some(RequiresPath::Param(param)) => param,
+                // Resolved and typed by rustc where the check is generated.
+                Some(RequiresPath::Constant) => return Ok(()),
+                None => {
+                    return Err(syn::Error::new_spanned(
+                        path,
+                        format!(
+                            "unknown identifier `{}` in requires: relations may only reference \
+                             this kernel's parameters and constants; {}",
+                            quote!(#path),
+                            requires_grammar_help(params)
+                        ),
+                    ));
+                }
             };
-            let Some(param) = params.iter().find(|param| param.name == *ident) else {
-                return Err(syn::Error::new_spanned(
-                    path,
-                    format!(
-                        "unknown identifier `{ident}` in requires: relations may only reference \
-                         this kernel's parameters; {}",
-                        requires_grammar_help(params)
-                    ),
-                ));
-            };
+            let ident = &param.name;
             match param.marshal {
                 CudaModuleParamMarshal::ReadOnlyDeviceBuffer { .. }
                 | CudaModuleParamMarshal::WritableDeviceBuffer { .. }
@@ -646,9 +742,15 @@ fn render_requires_expr(expr: &Expr) -> String {
             let lit = &literal.lit;
             quote!(#lit).to_string()
         }
-        Expr::Path(path) => match path.path.get_ident() {
+        Expr::Path(path) => match path.path.get_ident().filter(|_| path.qself.is_none()) {
             Some(ident) => ident.to_string(),
-            None => quote!(#path).to_string(),
+            // `quote!` spaces every token; the message shows the path as written.
+            None => quote!(#path)
+                .to_string()
+                .replace(" :: ", "::")
+                .replace(":: ", "::")
+                .replace("< ", "<")
+                .replace(" >", ">"),
         },
         Expr::MethodCall(call) => format!("{}.len()", render_requires_expr(&call.receiver)),
         Expr::Paren(paren) => format!("({})", render_requires_expr(&paren.expr)),
@@ -691,8 +793,11 @@ pub(super) fn generate_requires_checks(
         };
         let relation_text = render_requires_expr(relation);
         let op = &binary.op;
-        let lhs = requires_operand_tokens(&binary.left, access, &kernel_name, &relation_text);
-        let rhs = requires_operand_tokens(&binary.right, access, &kernel_name, &relation_text);
+        let params = &kernel.params;
+        let lhs =
+            requires_operand_tokens(&binary.left, params, access, &kernel_name, &relation_text);
+        let rhs =
+            requires_operand_tokens(&binary.right, params, access, &kernel_name, &relation_text);
         quote! {
             {
                 let #lhs_binding: u64 = #lhs;
@@ -717,6 +822,7 @@ pub(super) fn generate_requires_checks(
 /// expression with checked arithmetic.
 fn requires_operand_tokens(
     expr: &Expr,
+    params: &[CudaModuleParam],
     access: RequiresLenAccess,
     kernel_name: &str,
     relation_text: &str,
@@ -731,11 +837,13 @@ fn requires_operand_tokens(
                 .expect("requires literals are validated during contract construction");
             quote! { #value }
         }
-        Expr::Path(path) => {
+        Expr::Path(path) => match classify_requires_path(path, params) {
             // Validated: a bare unsigned integer scalar parameter, so `as
             // u64` is a lossless widening.
-            quote! { (#path as u64) }
-        }
+            Some(RequiresPath::Param(_)) => quote! { (#path as u64) },
+            Some(RequiresPath::Constant) => requires_constant_tokens(path),
+            None => unreachable!("requires operands are validated during contract construction"),
+        },
         Expr::MethodCall(call) => {
             let receiver = &call.receiver;
             match access {
@@ -749,14 +857,16 @@ fn requires_operand_tokens(
             }
         }
         Expr::Paren(paren) => {
-            requires_operand_tokens(&paren.expr, access, kernel_name, relation_text)
+            requires_operand_tokens(&paren.expr, params, access, kernel_name, relation_text)
         }
         Expr::Group(group) => {
-            requires_operand_tokens(&group.expr, access, kernel_name, relation_text)
+            requires_operand_tokens(&group.expr, params, access, kernel_name, relation_text)
         }
         Expr::Binary(binary) => {
-            let lhs = requires_operand_tokens(&binary.left, access, kernel_name, relation_text);
-            let rhs = requires_operand_tokens(&binary.right, access, kernel_name, relation_text);
+            let lhs =
+                requires_operand_tokens(&binary.left, params, access, kernel_name, relation_text);
+            let rhs =
+                requires_operand_tokens(&binary.right, params, access, kernel_name, relation_text);
             let checked = match binary.op {
                 syn::BinOp::Add(_) => quote! { checked_add },
                 syn::BinOp::Sub(_) => quote! { checked_sub },

@@ -3,7 +3,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use crate::cuda_module::contract::{LaunchContractArgs, validate_requires_relations};
+use crate::cuda_module::contract::{
+    LaunchContractArgs, requires_constant_checks, validate_requires_relations,
+};
 use crate::launch::{
     CudaLaunchAsyncInput, CudaLaunchInput, expand_cuda_launch, expand_cuda_launch_async,
     kernel_sibling_path,
@@ -78,6 +80,45 @@ fn standalone_launch_contract_validates_requires_against_fn_signature() {
     assert!(
         error.to_string().contains("unknown identifier `m`"),
         "{error}"
+    );
+}
+
+#[test]
+fn standalone_requires_names_its_constants_beside_the_kernel() {
+    let kernel: ItemFn = parse_quote! {
+        pub fn tiled<P: Policy>(n: u32, input: &[f32]) {}
+    };
+    let params = standalone_requires_params(&kernel).unwrap();
+    let args: LaunchContractArgs = syn::parse_str(
+        "domain = 1, block = (64, 1, 1), requires = (input.len() >= n * TILE + P::WIDTH)",
+    )
+    .unwrap();
+    let cfg: syn::Attribute = parse_quote! { #[cfg(feature = "tiles")] };
+    let checks = requires_constant_checks(
+        &args.requires,
+        &params,
+        &kernel.sig.generics,
+        std::slice::from_ref(&cfg),
+    )
+    .to_string()
+    .replace(' ', "");
+    assert!(
+        checks.starts_with("#[cfg(feature=\"tiles\")]const_:()="),
+        "{checks}"
+    );
+    assert!(
+        checks.contains("fn__cuda_oxide_requires_constants<P:Policy>()"),
+        "{checks}"
+    );
+    assert!(checks.contains("__widen_to_u64(TILE)"), "{checks}");
+    assert!(checks.contains("__widen_to_u64(P::WIDTH)"), "{checks}");
+    assert!(!checks.contains("__widen_to_u64(n)"), "{checks}");
+
+    let plain: LaunchContractArgs =
+        syn::parse_str("domain = 1, block = (64, 1, 1), requires = (input.len() >= n * 2)")
+            .unwrap();
+    assert!(
+        requires_constant_checks(&plain.requires, &params, &kernel.sig.generics, &[]).is_empty()
     );
 }
 

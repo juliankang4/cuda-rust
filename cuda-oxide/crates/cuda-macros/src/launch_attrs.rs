@@ -9,12 +9,14 @@
 
 use crate::common::attr_path_ends_with;
 use crate::cuda_module::contract::{
-    LaunchContractArgs, dynamic_shared_max, validate_requires_relations,
+    LaunchContractArgs, dynamic_shared_max, requires_constant_checks, validate_requires_relations,
 };
+use crate::cuda_module::cuda_module_cfg_attrs;
 use crate::cuda_module::model::{
     CudaModuleParam, CudaModuleParamMarshal, cuda_module_param_from_typed, scalar_int_class,
 };
 use proc_macro::TokenStream;
+use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
 use syn::{
     Expr, FnArg, GenericParam, Ident, ItemFn, Pat, Path, Stmt, Token,
@@ -60,17 +62,32 @@ pub(crate) fn launch_contract_entry(attr: TokenStream, item: TokenStream) -> Tok
     // the module macro validates first against the source signature; a
     // module-level rejection replaces the whole module with the error, so
     // this attribute never expands there and the two validations cannot
-    // stack duplicate diagnostics.
+    // stack duplicate diagnostics. The constants a relation names are
+    // resolved by rustc, so they are named next to the kernel as well; inside
+    // a #[cuda_module] the launchers name them with the same spans, and a
+    // rejected constant is reported once.
+    let mut constant_checks = TokenStream2::new();
     if !args.requires.is_empty()
         && let Some(params) = standalone_requires_params(&input)
-        && let Err(error) = validate_requires_relations(&args.requires, &params)
     {
-        return error.to_compile_error().into();
+        if let Err(error) = validate_requires_relations(&args.requires, &params) {
+            return error.to_compile_error().into();
+        }
+        let cfg_attrs = match cuda_module_cfg_attrs(&input.attrs) {
+            Ok(cfg_attrs) => cfg_attrs,
+            Err(error) => return error.to_compile_error().into(),
+        };
+        constant_checks =
+            requires_constant_checks(&args.requires, &params, &input.sig.generics, &cfg_attrs);
     }
 
     inject_launch_contract_markers(&args, &mut input);
 
-    quote! { #input }.into()
+    quote! {
+        #input
+        #constant_checks
+    }
+    .into()
 }
 
 /// Best-effort parameter model for validating `requires` relations on the
@@ -138,10 +155,15 @@ fn requires_params_from_inputs(
 /// a standalone generic kernel would compile clean while the identical
 /// non-generic kernel errors. Malformed argument lists are skipped here: the
 /// attribute macro reports those itself when it expands.
+///
+/// Returns the items that name the relations' constants under the source
+/// `generics` (see [`requires_constant_checks`]); the caller emits them.
 pub(crate) fn validate_routed_launch_contract_requires(
     attrs: &[syn::Attribute],
     source_inputs: &syn::punctuated::Punctuated<FnArg, syn::token::Comma>,
-) -> syn::Result<()> {
+    generics: &syn::Generics,
+) -> syn::Result<TokenStream2> {
+    let mut constant_checks = TokenStream2::new();
     for attr in attrs {
         if !attr_path_ends_with(attr, "launch_contract") {
             continue;
@@ -154,9 +176,16 @@ pub(crate) fn validate_routed_launch_contract_requires(
         }
         if let Some(params) = requires_params_from_inputs(source_inputs) {
             validate_requires_relations(&args.requires, &params)?;
+            let cfg_attrs = cuda_module_cfg_attrs(attrs)?;
+            constant_checks.extend(requires_constant_checks(
+                &args.requires,
+                &params,
+                generics,
+                &cfg_attrs,
+            ));
         }
     }
-    Ok(())
+    Ok(constant_checks)
 }
 
 pub(crate) fn inject_launch_contract_markers(args: &LaunchContractArgs, input: &mut ItemFn) {

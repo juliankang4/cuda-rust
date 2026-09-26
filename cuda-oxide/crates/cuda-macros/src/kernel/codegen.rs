@@ -44,9 +44,14 @@ pub(crate) fn generic_kernel_no_instantiation_tokens(
     // wrapper, whose synthetic parameter names cannot resolve source-level
     // `requires` identifiers, so those relations are validated here while the
     // original signature is still in scope.
-    if let Err(error) = validate_routed_launch_contract_requires(&input.attrs, &entry_inputs) {
-        return error.to_compile_error();
-    }
+    let requires_constant_checks = match validate_routed_launch_contract_requires(
+        &input.attrs,
+        &entry_inputs,
+        &input.sig.generics,
+    ) {
+        Ok(checks) => checks,
+        Err(error) => return error.to_compile_error(),
+    };
     let has_explicit_scope = explicit_scope.is_some();
     let rewritten_scope = if let Some(ident) = explicit_scope {
         Some(explicit_kernel_scope(&mut input, ident))
@@ -228,6 +233,8 @@ pub(crate) fn generic_kernel_no_instantiation_tokens(
         #instantiate_helper
 
         #generic_cuda_kernel_impl
+
+        #requires_constant_checks
     }
 }
 
@@ -498,9 +505,14 @@ pub(crate) fn generic_kernel_instantiation_tokens(
     // Same as the no-instantiation path: `requires` relations of a routed
     // `#[launch_contract]` must be validated against the source parameter
     // names before they are lost to the generated wrappers.
-    if let Err(error) = validate_routed_launch_contract_requires(&input.attrs, &entry_inputs) {
-        return error.to_compile_error();
-    }
+    let requires_constant_checks = match validate_routed_launch_contract_requires(
+        &input.attrs,
+        &entry_inputs,
+        &input.sig.generics,
+    ) {
+        Ok(checks) => checks,
+        Err(error) => return error.to_compile_error(),
+    };
     let has_explicit_scope = explicit_scope.is_some();
     let rewritten_scope = if let Some(ident) = explicit_scope {
         Some(explicit_kernel_scope(&mut input, ident))
@@ -646,6 +658,8 @@ pub(crate) fn generic_kernel_instantiation_tokens(
         #unchecked_impl_item
 
         #(#wrappers)*
+
+        #requires_constant_checks
     }
 }
 

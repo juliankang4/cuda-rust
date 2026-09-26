@@ -210,11 +210,13 @@ left-hand side is 8192, right-hand side is 16384
 
 Relations are deliberately *not* arbitrary Rust. Each one is a single
 comparison built from slice parameters as `name.len()`, unsigned integer
-scalar parameters, integer literals, parentheses, and `+ - *`. Two reasons:
+scalar parameters, unsigned integer constants (named in upper case, like
+`TILE`, or by path, like `P::TILE`), integer literals, parentheses, and
+`+ - *`. Two reasons:
 
-1. Every identifier is validated against the kernel's actual parameter
-   list, so a typo is a compile error, not a check against the wrong
-   value.
+1. Every lower-case identifier is validated against the kernel's actual
+   parameter list, and every constant is resolved by the compiler, so a
+   typo is a compile error, not a check against the wrong value.
 2. Every `+`, `-`, `*` compiles to checked `u64` arithmetic, so a huge
    `m * k` cannot wrap around to a small number and falsely pass.
 

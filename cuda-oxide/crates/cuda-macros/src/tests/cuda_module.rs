@@ -951,11 +951,59 @@ fn requires_rejects_relations_outside_the_v1_grammar() {
         "input.len() >= (n >= 1)",
         "nested comparisons are not supported",
     );
-    reject("input.len() >= self::n", "bare kernel parameter names");
+    reject("input.len() >= m", "unknown identifier `m`");
 
     // The full accepted grammar expands cleanly.
     expand_with_requires("(input.len() - 1) * 2 + 0 >= n * 3")
         .expect("grammar-conformant relation must expand");
+    expand_with_requires("input.len() >= n * TILE + self::tile")
+        .expect("constants named in upper case or by path must expand");
+}
+
+#[test]
+fn requires_constants_widen_through_the_sealed_constant_trait() {
+    let module: ItemMod = parse_quote! {
+        mod kernels {
+            #[kernel]
+            #[launch_contract(
+                domain = 1,
+                block = (128, 1, 1),
+                requires = (input.len() >= n * TILE, input.len() >= N * crate::shapes::ROWS),
+            )]
+            pub fn tiled(n: u32, N: u32, input: &[f32]) {}
+        }
+    };
+    let expanded = expand_cuda_module(module)
+        .expect("constant operands must expand")
+        .to_string();
+    // The error text shows a path as written.
+    assert!(
+        expanded.contains("\"input.len() >= N * crate::shapes::ROWS\""),
+        "{expanded}"
+    );
+    let compact = expanded.replace(' ', "");
+    assert!(
+        compact.contains(
+            "::cuda_device::thread::__LaunchContractRequiresConstant::__widen_to_u64(TILE)"
+        ),
+        "{compact}"
+    );
+    assert!(
+        compact.contains("__widen_to_u64(crate::shapes::ROWS)"),
+        "{compact}"
+    );
+    // A parameter is a parameter whatever its spelling.
+    assert!(compact.contains("(nasu64)"), "{compact}");
+    assert!(compact.contains("(Nasu64)"), "{compact}");
+    assert!(!compact.contains("__widen_to_u64(N)"), "{compact}");
+
+    // Relations over parameters and literals name no constant, so their
+    // expansion carries no widening helper.
+    let plain = expand_to_compact_string(requires_demo_module());
+    assert!(
+        !plain.contains("__LaunchContractRequiresConstant"),
+        "{plain}"
+    );
 }
 
 #[test]

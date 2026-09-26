@@ -1,4 +1,4 @@
-error: `.len()` in requires is only available on slice or DisjointSlice parameters; `n` is a scalar; each requires relation is one comparison (`>=`, `>`, `<=`, `<`, `==`, `!=`) between expressions built from slice parameters as `<param>.len()`, unsigned integer scalar parameters (u8/u16/u32/u64/usize), integer literals, parentheses, and `+`, `-`, `*`; available operands: `n`, `output.len()`
+error: `.len()` in requires is only available on slice or DisjointSlice parameters; `n` is a scalar; each requires relation is one comparison (`>=`, `>`, `<=`, `<`, `==`, `!=`) between expressions built from slice parameters as `<param>.len()`, unsigned integer scalar parameters (u8/u16/u32/u64/usize), constants of those types named in upper case or by path (`TILE`, `P::TILE`), integer literals, parentheses, and `+`, `-`, `*`; available operands: `n`, `output.len()`
   --> tests/compile_fail/launch_contract_requires_len_on_scalar.rs:13:21
    |
 13 |         requires = (n.len() >= 4),

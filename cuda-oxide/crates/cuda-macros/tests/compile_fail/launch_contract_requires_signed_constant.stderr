@@ -1,0 +1,14 @@
+error[E0277]: a constant in a `requires` relation must be an unsigned integer (u8, u16, u32, u64 or usize), found `i32`
+  --> tests/compile_fail/launch_contract_requires_signed_constant.rs:18:40
+   |
+18 |         requires = (input.len() >= n + OFFSET),
+   |                                        ^^^^^^ not an unsigned integer that widens to u64 without loss
+   |
+   = help: the trait `cuda_device::__LaunchContractRequiresConstant` is not implemented for `i32`
+   = note: `requires` relations are evaluated in u64, like the unsigned scalar parameters they may also name
+   = help: the following other types implement trait `cuda_device::__LaunchContractRequiresConstant`:
+             u16
+             u32
+             u64
+             u8
+             usize
