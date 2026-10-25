@@ -383,6 +383,45 @@ pub fn emit_function_call(
         }
     }
 
+    // Ordinary Rust helper signatures also expose generic pointers. Resolve
+    // the monomorphized operand type (not an unresolved trait signature), and
+    // adapt only address space. All other type/provenance mismatches still
+    // reach the independently typed callee's verifier unchanged.
+    if external_callee_type.is_none() {
+        for (argument, operand) in arg_values.iter_mut().zip(args) {
+            if argument
+                .get_type(ctx)
+                .deref(ctx)
+                .downcast_ref::<MirPtrType>()
+                .is_none()
+            {
+                continue;
+            }
+            let rust_type = match operand.ty(body.locals()) {
+                Ok(ty) => ty,
+                Err(error) => {
+                    return input_err!(
+                        loc.clone(),
+                        TranslationErr::unsupported(format!(
+                            "failed to resolve Rust call argument type: {error:?}"
+                        ))
+                    );
+                }
+            };
+            let declared = crate::translator::types::translate_type(ctx, &rust_type)?;
+            let (normalized, tail) = normalize_foreign_pointer_argument(
+                ctx,
+                *argument,
+                declared,
+                block_ptr,
+                last_op,
+                loc.clone(),
+            );
+            *argument = normalized;
+            last_op = tail;
+        }
+    }
+
     let (prepared_destination, prepared_last_op) = prepare_destination_write(
         ctx,
         body,
@@ -445,8 +484,8 @@ pub fn emit_function_call(
     }
 }
 
-/// Adapt a foreign-call pointer argument only when the address space is the
-/// sole difference from its declared ABI parameter type.
+/// Adapt a foreign or Rust call pointer argument only when the address space
+/// is the sole difference from its declared parameter type.
 fn normalize_foreign_pointer_argument(
     ctx: &mut Context,
     value: Value,

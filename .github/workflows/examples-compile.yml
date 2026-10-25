@@ -4,7 +4,7 @@ name: examples-compile
 # Path-filtered SIMT lane (same roots as ci.yml).
 on:
   push:
-    branches: [main]
+    branches: [main, bloomery]
     paths:
       - 'cuda-oxide/**'
       - 'cuda-bindings/**'
@@ -15,7 +15,7 @@ on:
       - 'Cargo.lock'
       - '.github/workflows/**'
   pull_request:
-    branches: [main]
+    branches: [main, bloomery]
     paths:
       - 'cuda-oxide/**'
       - 'cuda-bindings/**'
@@ -128,6 +128,25 @@ jobs:
           export LD_LIBRARY_PATH="${sysroot}/lib:${LD_LIBRARY_PATH:-}"
 
           cuda-oxide/scripts/smoketest.sh --compile-only --no-color
+
+      - name: Compile shared-memory helper calls
+        timeout-minutes: 10
+        working-directory: cuda-oxide
+        env:
+          CUDA_TOOLKIT_PATH: ${{ steps.cuda-toolkit.outputs.CUDA_PATH }}
+          CUDA_OXIDE_LLC: /usr/bin/llc-22
+          CARGO_TARGET_DIR: ${{ runner.temp }}/examples-shared-target
+          CARGO_INCREMENTAL: "0"
+        run: |
+          set -euo pipefail
+          sysroot="$(rustc --print sysroot)"
+          export LIBRARY_PATH="${sysroot}/lib:${LIBRARY_PATH:-}"
+          export LD_LIBRARY_PATH="${sysroot}/lib:${LD_LIBRARY_PATH:-}"
+
+          for features in local-helper cross-crate-helper; do
+            cargo oxide build shared_memory_helper --arch sm_90 --features "$features" \
+              2>&1 | tee "${RUNNER_TEMP}/shared-memory-${features}-build.log"
+          done
 
       - name: Artifact modes keep shared Cargo dependencies fresh
         timeout-minutes: 10
@@ -266,6 +285,7 @@ jobs:
           # `if-no-files-found: ignore` below made that silent.
           path: |
             ${{ runner.temp }}/smoketest-logs/
+            ${{ runner.temp }}/shared-memory-*-build.log
             ${{ runner.temp }}/vecadd-*-build.log
             ${{ runner.temp }}/iket-trace-*-build.log
             ${{ runner.temp }}/cross-crate-*-build.log
