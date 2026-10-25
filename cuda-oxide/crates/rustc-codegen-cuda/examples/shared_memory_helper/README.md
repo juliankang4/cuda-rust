@@ -103,9 +103,8 @@ cargo oxide build shared_memory_helper --arch sm_120a
   crates/rustc-codegen-cuda/examples/shared_memory_helper/target/release/shared_memory_helper
 ```
 
-Build each helper variant separately; these currently fail as described below.
-Do not run a binary left over from the successful control build as evidence
-that a failed helper build worked.
+Build each helper variant separately, then run its binary with the same
+sanitizer commands. Stop on a failed build to avoid running a stale binary.
 
 ```bash
 cargo oxide build shared_memory_helper \
@@ -119,54 +118,23 @@ Repeat with `--features local-helper,force-inline`,
 `cross-crate-helper,heuristic-inline` to compare inlining policies.
 Set `CUDA_OXIDE_DUMP_MIR=1` to inspect the imported helper definition and call.
 
-## Observed results
+## Expected results
 
-Tested on 2026-09-17 against `main` at
-`7ce30ec798c490e6ed772dfcbad193b3733fe55a`, with this example added, on an
-RTX 5090, NVIDIA driver 580.173.02, and CUDA tools 13.3.
+The direct control and both helper variants must build and report a `PASS`
+marker after checking the data and barrier results. The `examples-compile`
+workflow builds both helper variants on `main` and `bloomery` with their
+default `#[inline(never)]` policy.
 
-| Variant | Result |
-| --- | --- |
-| Direct control | Builds; GPU checks pass |
-| Local helper, all three inline policies | MIR verification rejects the call |
-| Dependency helper, all three inline policies | Same rejection |
+The imported argument has address space 3 (shared memory), while the helper
+parameter has address space 0 (generic memory). The importer adapts that
+address-space difference before call verification. Pointee, mutability and
+pointer kind must still match.
 
 With no features, the `SharedPtr` probe runs after the direct control and
 reports `PASS shared-ptr: 9 launches, 36 CTA data/barrier checks`, and the
 shapes probe reports `PASS shared-ptr-shapes: 3 launches, 384 slot checks`,
 on the LLVM NVPTX route and with `--emit-nvvm-ir --arch sm_120`.
 
-Both Compute Sanitizer runs of the direct control reported:
-
-```text
-PASS direct: 9 launches, 36 CTA data/barrier checks
-========= ERROR SUMMARY: 0 errors
-```
-
-All six helper builds failed with:
-
-```text
-MirCallOp argument 0 type does not match callee signature
-```
-
-The imported call passes `mir.ptr<ui8, mutable:true, addrspace:3, kind:RawMut>`
-(shared memory), while the helper parameter is
-`mir.ptr<ui8, mutable:true, addrspace:0, kind:RawMut>` (generic memory). The
-helper body is present in the imported module, including for the dependency
-crate. Ordinary Rust calls do not receive the address-space adaptation that
-the importer applies to foreign calls. Strict call verification rejects the
-mismatch before backend code generation. Requesting `inline(always)` did not
-remove the call before this verification in the tested builds.
-
-This reproduces a compile-time rejection of this raw-byte-pointer boundary.
-It does not demonstrate silent miscompilation or prove runtime correctness
-of a surviving helper call, because no helper variant reached GPU execution.
-The dependency test imports available MIR across crates; it does not test an
-opaque, separately linked device binary. The runtime control checks one-thread
+The dependency variant imports available MIR across crates; it does not test
+an opaque, separately linked device binary. The runtime checks one-thread
 barrier behavior, not synchronization between multiple threads or TMA traffic.
-
-The diagnostic currently exposes an internal MIR mismatch. This reproducer
-does not change the diagnostic or implement the missing call conversion.
-Pointers whose pointee is `Barrier` or `SharedArray` already receive a shared
-address space, so this result should not be generalized to every helper that
-accepts shared memory.
