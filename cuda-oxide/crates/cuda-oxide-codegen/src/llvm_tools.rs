@@ -67,6 +67,8 @@ pub struct LlvmToolchain {
     pub llc_path: String,
     /// `llc`'s LLVM major (from `llc --version`), `None` if unparseable.
     pub llc_major: Option<u32>,
+    /// Complete version banner from the selected `llc`, when it ran successfully.
+    pub llc_version: Option<String>,
     /// Whether `llc_path` came from `opts.llc_override` (historically
     /// `CUDA_OXIDE_LLC`; affects messages).
     pub llc_from_env: bool,
@@ -91,7 +93,7 @@ impl LlvmToolchain {
     /// Selection warnings are returned in [`LlvmToolchain::diagnostics`].
     /// Library code never writes them directly to stdout or stderr.
     pub fn resolve(opts: &BackendOptions) -> Option<Self> {
-        let (llc_path, llc_major, llc_from_env) = resolve_llc(opts)?;
+        let (llc_path, llc_major, llc_from_env, llc_version) = resolve_llc(opts)?;
 
         let (opt, mut diagnostics) = if opts.no_opt {
             // Explicit user intent: skip the middle-end, no warning needed.
@@ -140,6 +142,7 @@ impl LlvmToolchain {
             llc_path,
             llc_major,
             llc_from_env,
+            llc_version,
             opt,
             llvm_link,
             diagnostics,
@@ -151,13 +154,14 @@ impl LlvmToolchain {
 /// `opts.llc_override` (historically `CUDA_OXIDE_LLC`; used exclusively,
 /// even if it cannot be probed - the pinned binary's own errors must
 /// surface), then the Rust toolchain's llvm-tools `llc`, then `llc-23` /
-/// `llc-22` / `llc-21` on `PATH` (first runnable wins). Returns `(path,
-/// major, from_override)`.
-fn resolve_llc(opts: &BackendOptions) -> Option<(String, Option<u32>, bool)> {
+/// `llc-22` / `llc-21` on `PATH` (first runnable wins). Returns the path,
+/// major, override provenance, and successful version banner.
+fn resolve_llc(opts: &BackendOptions) -> Option<(String, Option<u32>, bool, Option<String>)> {
     if let Some(path) = &opts.llc_override {
-        let path = path.to_string_lossy().into_owned();
-        let major = probe_runnable(&path).and_then(|t| t.major);
-        return Some((path, major, true));
+        let path = selected_llc_path(path.to_string_lossy().into_owned(), opts);
+        let version = probe_version(&path);
+        let major = version.as_deref().and_then(parse_llvm_major);
+        return Some((path, major, true, version));
     }
 
     let mut candidates: Vec<String> = Vec::new();
@@ -168,10 +172,46 @@ fn resolve_llc(opts: &BackendOptions) -> Option<(String, Option<u32>, bool)> {
     candidates.push("llc-22".to_string());
     candidates.push("llc-21".to_string());
 
-    candidates
-        .into_iter()
-        .find_map(|c| probe_runnable(&c))
-        .map(|t| (t.path, t.major, false))
+    candidates.into_iter().find_map(|path| {
+        let path = selected_llc_path(path, opts);
+        let version = probe_version(&path)?;
+        let major = parse_llvm_major(&version);
+        Some((path, major, false, Some(version)))
+    })
+}
+
+fn selected_llc_path(path: String, opts: &BackendOptions) -> String {
+    if opts.required_llc_major.is_none() {
+        return path;
+    }
+    let command = Path::new(&path);
+    let resolved = if command.is_absolute() || command.components().count() > 1 {
+        std::fs::canonicalize(command).ok()
+    } else {
+        std::env::var_os("PATH").and_then(|search| {
+            std::env::split_paths(&search).find_map(|directory| {
+                let mut candidate = directory.join(command);
+                if cfg!(windows) && candidate.extension().is_none() {
+                    candidate.set_extension("exe");
+                }
+                let metadata = std::fs::metadata(&candidate).ok()?;
+                if !metadata.is_file() {
+                    return None;
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if metadata.permissions().mode() & 0o111 == 0 {
+                        return None;
+                    }
+                }
+                std::fs::canonicalize(candidate).ok()
+            })
+        })
+    };
+    resolved
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or(path)
 }
 
 /// The result of [`choose_opt`]: either a usable `opt`, or skip the
@@ -421,7 +461,7 @@ pub(crate) fn llvm_link_mismatch_warning(
 /// libdevice file existence alone would later emit PTX with unresolved
 /// `.extern .func __nv_*` whenever `llvm-link` turns out to be missing.
 pub(crate) fn libdevice_ir_linking_available(opts: &BackendOptions) -> bool {
-    let Some((llc_path, llc_major, _)) = resolve_llc(opts) else {
+    let Some((llc_path, llc_major, _, _)) = resolve_llc(opts) else {
         return false;
     };
     resolve_sibling_tool("llvm-link", "CUDA_OXIDE_LLVM_LINK", &llc_path, llc_major).is_some()
@@ -430,6 +470,14 @@ pub(crate) fn libdevice_ir_linking_available(opts: &BackendOptions) -> bool {
 /// Runs `cmd --version` and, on success, returns the tool with its parsed
 /// major. `None` means the binary does not exist or is not runnable.
 pub(crate) fn probe_runnable(cmd: &str) -> Option<OptTool> {
+    let version = probe_version(cmd)?;
+    Some(OptTool {
+        path: cmd.to_string(),
+        major: parse_llvm_major(&version),
+    })
+}
+
+fn probe_version(cmd: &str) -> Option<String> {
     let out = std::process::Command::new(cmd)
         .arg("--version")
         .output()
@@ -437,11 +485,10 @@ pub(crate) fn probe_runnable(cmd: &str) -> Option<OptTool> {
     if !out.status.success() {
         return None;
     }
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    Some(OptTool {
-        path: cmd.to_string(),
-        major: parse_llvm_major(&stdout),
-    })
+    Some(
+        String::from_utf8(out.stdout)
+            .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned()),
+    )
 }
 
 /// Path of `tool` inside the Rust toolchain's llvm-tools component:
