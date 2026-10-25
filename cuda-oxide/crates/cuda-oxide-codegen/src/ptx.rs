@@ -475,7 +475,7 @@ pub(crate) fn generate_ptx(
 pub(crate) fn discover_llvm_toolchain(
     opts: &BackendOptions,
 ) -> Result<LlvmToolchain, PipelineError> {
-    LlvmToolchain::resolve(opts).ok_or_else(|| {
+    let mut toolchain = LlvmToolchain::resolve(opts).ok_or_else(|| {
         PipelineError::PtxGeneration(
             "No working llc found.\n\
              cuda-oxide tries (in order): opts.llc_override (CUDA_OXIDE_LLC), the \
@@ -487,7 +487,56 @@ pub(crate) fn discover_llvm_toolchain(
              Or set opts.llc_override (CUDA_OXIDE_LLC) to a specific binary."
                 .to_string(),
         )
-    })
+    })?;
+    if let Some(required) = &opts.required_llc_major {
+        enforce_required_llc_major(&mut toolchain, required)?;
+    }
+    Ok(toolchain)
+}
+
+fn enforce_required_llc_major(
+    toolchain: &mut LlvmToolchain,
+    required: &str,
+) -> Result<(), PipelineError> {
+    let required_major = required
+        .parse::<u32>()
+        .ok()
+        .filter(|major| *major > 0 && required.bytes().all(|byte| byte.is_ascii_digit()))
+        .ok_or_else(|| {
+            PipelineError::PtxGeneration(format!(
+                "invalid CUDA_OXIDE_REQUIRED_LLC_MAJOR `{required}`: expected a positive LLVM major"
+            ))
+        })?;
+    let source = if toolchain.llc_from_env {
+        "CUDA_OXIDE_LLC"
+    } else {
+        "automatic discovery"
+    };
+    let path = &toolchain.llc_path;
+    let Some(version) = &toolchain.llc_version else {
+        return Err(PipelineError::PtxGeneration(format!(
+            "{source} selected llc `{path}`, but `{path} --version` did not run successfully; \
+             required LLVM {required_major}"
+        )));
+    };
+    let banner = version
+        .lines()
+        .find(|line| line.contains("LLVM version "))
+        .unwrap_or_else(|| version.trim());
+    let selection = format!("llc = {path} ({banner}; selected by {source})");
+    match toolchain.llc_major {
+        Some(major) if major == required_major => {
+            toolchain.diagnostics.push(selection);
+            Ok(())
+        }
+        Some(major) => Err(PipelineError::PtxGeneration(format!(
+            "{selection}: unsupported LLVM major {major}; required LLVM {required_major}. \
+             Set CUDA_OXIDE_LLC to an LLVM {required_major} llc"
+        ))),
+        None => Err(PipelineError::PtxGeneration(format!(
+            "{selection}: could not parse the LLVM major; required LLVM {required_major}"
+        ))),
+    }
 }
 
 /// Generate PTX with a toolchain from [`discover_llvm_toolchain`], reporting
@@ -1086,6 +1135,132 @@ fn strip_target_debug_from_ptx_text(ptx: &str) -> Result<String, String> {
 mod tests {
     use super::*;
 
+    #[test]
+    #[cfg(unix)]
+    fn required_llc_major_is_enforced_on_the_selected_executable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let llc = root.path().join("llc-explicit");
+        let marker = root.path().join("compiled");
+        let mut opts = BackendOptions {
+            no_opt: true,
+            llc_override: Some(llc.clone()),
+            required_llc_major: Some("21".to_string()),
+            ..BackendOptions::default()
+        };
+        for (banner, status, expected) in [
+            ("Ubuntu LLVM version 21.1.8", 0, None),
+            (
+                "LLVM version 23.1.0-rust-1.100.0-nightly",
+                0,
+                Some("unsupported LLVM major 23"),
+            ),
+            (
+                "not an LLVM version banner",
+                0,
+                Some("could not parse the LLVM major"),
+            ),
+            ("LLVM version 21.1.8", 1, Some("did not run successfully")),
+        ] {
+            std::fs::write(
+                &llc,
+                format!(
+                    "#!/bin/sh\nif [ \"$1\" = --version ]; then\n  echo '{banner}'\n  exit {status}\nfi\ntouch '{}'\n",
+                    marker.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&llc, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let result = discover_llvm_toolchain(&opts);
+            if let Some(expected) = expected {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains(expected), "{error}");
+                assert!(error.contains(llc.to_str().unwrap()), "{error}");
+                assert!(error.contains("required LLVM 21"), "{error}");
+                assert!(error.contains("CUDA_OXIDE_LLC"), "{error}");
+            } else {
+                let selected = result.unwrap();
+                assert_eq!(selected.llc_major, Some(21));
+                assert!(selected.diagnostics.iter().any(|message| {
+                    message.contains(llc.to_str().unwrap()) && message.contains(banner)
+                }));
+            }
+            assert!(!marker.exists(), "discovery must not compile with llc");
+        }
+        for required in ["", "0", "21.1", "garbage"] {
+            opts.required_llc_major = Some(required.to_string());
+            let error = discover_llvm_toolchain(&opts).unwrap_err().to_string();
+            assert!(
+                error.contains("invalid CUDA_OXIDE_REQUIRED_LLC_MAJOR"),
+                "{error}"
+            );
+        }
+        opts.required_llc_major = Some("21".to_string());
+        std::fs::set_permissions(&llc, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let error = discover_llvm_toolchain(&opts).unwrap_err().to_string();
+        assert!(error.contains(llc.to_str().unwrap()), "{error}");
+        assert!(error.contains("did not run successfully"), "{error}");
+        std::fs::remove_file(&llc).unwrap();
+        let error = discover_llvm_toolchain(&opts).unwrap_err().to_string();
+        assert!(error.contains(llc.to_str().unwrap()), "{error}");
+        assert!(error.contains("did not run successfully"), "{error}");
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn required_llc_major_does_not_skip_an_incompatible_automatic_selection() {
+        const CHILD: &str = "CUDA_OXIDE_TEST_REQUIRED_LLC_PATH";
+        if let Some(root) = std::env::var_os(CHILD) {
+            let opts = BackendOptions {
+                no_opt: true,
+                required_llc_major: Some("21".to_string()),
+                ..BackendOptions::default()
+            };
+            let error = discover_llvm_toolchain(&opts).unwrap_err().to_string();
+            let selected = Path::new(&root).join("llc-23");
+            assert!(error.contains(selected.to_str().unwrap()), "{error}");
+            assert!(error.contains("unsupported LLVM major 23"), "{error}");
+            let legacy = BackendOptions {
+                required_llc_major: None,
+                ..opts
+            };
+            assert_eq!(
+                discover_llvm_toolchain(&legacy).unwrap().llc_major,
+                Some(23)
+            );
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        for (name, body) in [
+            ("rustc", "exit 1"),
+            ("llc-23", "echo 'LLVM version 23.1.0'"),
+            ("llc-21", "echo 'LLVM version 21.1.8'"),
+        ] {
+            let path = root.path().join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "ptx::tests::required_llc_major_does_not_skip_an_incompatible_automatic_selection",
+                "--nocapture",
+            ])
+            .env(CHILD, root.path())
+            .env("PATH", root.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[cfg(unix)]
     static LEGACY_DIAGNOSTICS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
@@ -1119,6 +1294,7 @@ mod tests {
         let toolchain = LlvmToolchain {
             llc_path: posix_utility("true"),
             llc_major: Some(21),
+            llc_version: None,
             llc_from_env: false,
             opt: Some(crate::llvm_tools::OptTool {
                 path: opt_path.clone(),
@@ -1512,6 +1688,7 @@ mod tests {
         let toolchain = LlvmToolchain {
             llc_path: posix_utility("true"),
             llc_major: Some(23),
+            llc_version: None,
             llc_from_env: false,
             opt: Some(crate::llvm_tools::OptTool {
                 path: opt_path.to_string_lossy().into_owned(),

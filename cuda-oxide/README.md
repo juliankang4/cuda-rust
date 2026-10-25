@@ -221,6 +221,22 @@ llc-21 --version | grep nvptx
 The pipeline prefers `llc` in Rust toolchain, and auto-discovers `llc-23`, `llc-22`, and `llc-21` on `PATH` (in that order).
 To pin a specific binary, set `CUDA_OXIDE_LLC=/usr/bin/llc-21`.
 
+Projects that require reproducible PTX from one LLVM major can set
+`CUDA_OXIDE_REQUIRED_LLC_MAJOR=21`. The PTX build reports the selected executable
+and its version banner even without verbose mode, and refuses another major,
+an unparseable version, or an override that cannot run. Selection precedence is
+unchanged: an incompatible selected tool is refused, not silently replaced.
+This check runs before LLVM optimization and PTX emission, not before Cargo's
+host compilation. It does not apply to the libNVVM/cubin path, which does not
+use `llc`, or to plain host-only Cargo commands.
+
+To make this the default for a project, put the policy in `.cargo/cuda-oxide.toml`:
+
+```toml
+[env]
+CUDA_OXIDE_REQUIRED_LLC_MAJOR = "21"
+```
+
 > We emit TMA / tcgen05 / WGMMA intrinsics that `llc` from LLVM 20 and earlier can't handle.
 > Simple kernels might still work with an older `llc`, but anything Hopper / Blackwell needs 21+.
 

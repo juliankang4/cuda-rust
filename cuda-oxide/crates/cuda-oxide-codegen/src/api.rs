@@ -505,6 +505,7 @@ impl Toolchain {
         let inner = LlvmToolchain {
             llc_path: llc_tool.path,
             llc_major: llc_tool.major,
+            llc_version: None,
             llc_from_env: false,
             opt: opt.map(|tool| OptTool {
                 path: tool.path,
@@ -675,6 +676,7 @@ impl Compiler {
             no_fma: !options.fma_contraction,
             verbose: options.verbose,
             llc_override: None,
+            required_llc_major: None,
             opt_override: None,
             mir_pass_pipeline: options.mir_pass_pipeline.clone(),
             module_disambiguator: None,

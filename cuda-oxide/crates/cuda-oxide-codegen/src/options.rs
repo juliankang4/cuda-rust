@@ -93,6 +93,8 @@ pub struct BackendOptions {
     pub verbose: bool,
     /// Explicit `llc` binary (was `CUDA_OXIDE_LLC`).
     pub llc_override: Option<PathBuf>,
+    /// Required LLVM major for PTX builds; invalid spellings are refused at discovery.
+    pub required_llc_major: Option<String>,
     /// Explicit `opt` binary (was `CUDA_OXIDE_OPT`).
     pub opt_override: Option<PathBuf>,
     /// Optional staged dialect-mir pass pipeline (`CUDA_OXIDE_MIR_PASSES`).
@@ -125,6 +127,7 @@ impl Default for BackendOptions {
             no_fma: false,
             verbose: false,
             llc_override: None,
+            required_llc_major: None,
             opt_override: None,
             mir_pass_pipeline: None,
             module_disambiguator: None,
@@ -169,6 +172,8 @@ impl BackendOptions {
             no_fma: std::env::var("CUDA_OXIDE_NO_FMA").is_ok(),
             verbose: std::env::var("CUDA_OXIDE_VERBOSE").is_ok(),
             llc_override: std::env::var("CUDA_OXIDE_LLC").ok().map(PathBuf::from),
+            required_llc_major: std::env::var_os("CUDA_OXIDE_REQUIRED_LLC_MAJOR")
+                .map(|value| value.to_string_lossy().into_owned()),
             opt_override: std::env::var("CUDA_OXIDE_OPT").ok().map(PathBuf::from),
             mir_pass_pipeline: std::env::var("CUDA_OXIDE_MIR_PASSES").ok(),
             // Compilation identity, not an environment compatibility knob:
