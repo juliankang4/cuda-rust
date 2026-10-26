@@ -2557,36 +2557,28 @@ mod tests {
 
         let fields = struct_fields(&ctx, map.llvm_struct_ty);
 
-        // Required enum alignment is 16, while the 16-byte filler itself is
-        // deliberately represented as two i64 leaves with natural alignment 8.
-        // build_enum_slot_map supplies the zero-length alignment anchor separately.
-        assert_eq!(fields.len(), 4);
-
-        let filler_ref = fields[1].deref(&ctx);
-        let filler = filler_ref
-            .downcast_ref::<llvm_types::ArrayType>()
-            .expect("16-byte enum filler should lower to an LLVM array");
-
+        // The payload decomposes: the u128 leaf gets its own i128 slot, the
+        // pointer leaf shares the niche carrier, and the tail is filler. The
+        // i128 slot carries the required 16-byte alignment, so no zero-length
+        // anchor is needed.
+        assert_eq!(fields.len(), 3);
         assert_eq!(
-            filler.size(),
-            2,
-            "16-byte enum filler should use two 64-bit leaves"
-        );
-
-        assert_eq!(
-            filler
-                .elem_type()
+            fields[0]
                 .deref(&ctx)
                 .downcast_ref::<IntegerType>()
                 .map(IntegerType::width),
-            Some(64),
-            "16-byte enum filler elements should be i64"
+            Some(128),
+            "the u128 leaf should lower to an i128 slot"
+        );
+        assert!(
+            fields[1].deref(&ctx).is::<llvm_types::PointerType>(),
+            "the pointer leaf should share the niche carrier slot"
         );
 
         assert_eq!(
             llvm_type_size_align(&ctx, map.llvm_struct_ty),
             Some((32, 16)),
-            "typed 16-byte filler must preserve rustc's enum size and alignment"
+            "the decomposed payload must preserve rustc's enum size and alignment"
         );
     }
 
