@@ -137,7 +137,7 @@ jobs:
         working-directory: cuda-oxide
         env:
           CUDA_TOOLKIT_PATH: ${{ steps.cuda-toolkit.outputs.CUDA_PATH }}
-          CUDA_OXIDE_LLC: /usr/bin/llc-22
+          CUDA_OXIDE_LLC: /usr/bin/llc-23
           CARGO_TARGET_DIR: ${{ runner.temp }}/examples-shared-target
           CARGO_INCREMENTAL: "0"
         run: |
